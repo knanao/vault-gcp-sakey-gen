@@ -29,7 +29,7 @@ func main() {
 	flag.StringVar(&serviceAccountTokenPath, "service-account-token-path", "/var/run/secrets/kubernetes.io/serviceaccount/token", "The path of application's Kubernetes service account token.")
 	flag.StringVar(&gcpServiceAccountKeyTTL, "ttl", "24h", "Time to live (TTL) for service account key.")
 	flag.StringVar(&bucket, "bucket", "", "The bucket name of Google Cloud Storage(GCS).")
-	flag.StringVar(&targets, "targets", "", "The target mount paths of the GCP secret engine must include a trailing /. e.g. -filter=gcp/,gcp/dev/")
+	flag.StringVar(&targets, "targets", "", "The target mount paths of the GCP secret engine must include a trailing /. e.g. -targets=gcp/,gcp/dev/")
 	flag.BoolVar(&force, "force", false, "By default, the key file is named with a timestamp. If this flag is enabled, the name of the static accounts is used instead, and the file is overridden each time.")
 	flag.Parse()
 
@@ -90,7 +90,7 @@ func main() {
 		logger.Warn("No gcp mount was enabled, so skip the operation")
 		return
 	}
-	if len(targetPaths) > 1 {
+	if len(targets) > 0 && len(targetPaths) > 0 {
 		ts := make([]string, 0, len(targetPaths))
 		for _, t := range targetPaths {
 			if slices.Contains(mountPaths, t) {
@@ -116,6 +116,7 @@ func main() {
 		var mg multierror.Group
 		for _, account := range serviceAccounts {
 			name := account
+
 			mg.Go(func() error {
 				generateKey := fmt.Sprintf("%s%s/%s/%s", mountPath, "static-account", name, "key")
 				req := map[string][]string{"ttl": {gcpServiceAccountKeyTTL}}
@@ -213,7 +214,8 @@ func main() {
 func retry(f func(p string) error, args string, attempts int, sleep time.Duration) error {
 	var err error
 	for i := 0; i < attempts; i++ {
-		if err := f(args); err == nil {
+		err = f(args)
+		if err == nil {
 			return nil
 		}
 		time.Sleep(sleep)
