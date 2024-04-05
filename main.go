@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,44 +21,61 @@ func main() {
 	var serviceAccountTokenPath string
 	var gcpServiceAccountKeyTTL string
 	var bucket string
+	var target string
+	var force bool
 
 	flag.StringVar(&kubernetesAuthRole, "kubernetes-auth-role", "", "The role name of the Kubernetes auth.")
 	flag.StringVar(&serviceAccountTokenPath, "service-account-token-path", "/var/run/secrets/kubernetes.io/serviceaccount/token", "The path of application's Kubernetes service account token.")
 	flag.StringVar(&gcpServiceAccountKeyTTL, "ttl", "24h", "Time to live (TTL) for service account key.")
 	flag.StringVar(&bucket, "bucket", "", "The bucket name of Google Cloud Storage(GCS).")
-
+	flag.StringVar(&target, "target", "", "The target mount paths of the GCP secret engine must include a trailing /. e.g. -filter=gcp/,gcp/dev/")
+	flag.BoolVar(&force, "force", false, "By default, the key file is named with a timestamp. If this flag is enabled, the name of the static accounts is used instead, and the file is overridden each time.")
 	flag.Parse()
+
 	logger := hclog.New(&hclog.LoggerOptions{
 		Name:  "vault-gcp-sakey-gen",
 		Level: hclog.LevelFromString("INFO"),
 	})
-
 	logger.Info("Starting generator")
 
-	now := time.Now()
-	config := vault.DefaultConfig()
-	ctx := context.Background()
-	client, err := vault.NewClient(config)
-	if err != nil {
-		logger.Error("Unable to initialize Vault client", err)
-		os.Exit(1)
-	}
-	k8sAuth, err := auth.NewKubernetesAuth(
-		kubernetesAuthRole,
-		auth.WithServiceAccountTokenPath(serviceAccountTokenPath),
+	var (
+		now         = time.Now()
+		config      = vault.DefaultConfig()
+		targetPaths = strings.Split(target, ",")
+		ctx         = context.Background()
+
+		client *vault.Client
+		err    error
 	)
-	if err != nil {
-		logger.Error("Unable to initialize Kubernetes auth method", err)
-		os.Exit(1)
+	{
+		client, err = vault.NewClient(config)
+		if err != nil {
+			logger.Error("Unable to initialize Vault client", err)
+			os.Exit(1)
+		}
+		k8sAuth, err := auth.NewKubernetesAuth(
+			kubernetesAuthRole,
+			auth.WithServiceAccountTokenPath(serviceAccountTokenPath),
+		)
+		if err != nil {
+			logger.Error("Unable to initialize Kubernetes auth method", err)
+			os.Exit(1)
+		}
+
+		authInfo, err := client.Auth().Login(ctx, k8sAuth)
+		if err != nil {
+			logger.Error("Unable to log in with Kubernetes auth", err)
+			os.Exit(1)
+		}
+		if authInfo == nil {
+			logger.Error("No auth info was returned after login")
+			os.Exit(1)
+		}
 	}
 
-	authInfo, err := client.Auth().Login(ctx, k8sAuth)
+	gcsClient, err := storage.NewClient(ctx)
 	if err != nil {
-		logger.Error("Unable to log in with Kubernetes auth", err)
-		os.Exit(1)
-	}
-	if authInfo == nil {
-		logger.Error("No auth info was returned after login")
+		logger.Error("Unable to initialize GCS client", err)
 		os.Exit(1)
 	}
 
@@ -71,57 +89,95 @@ func main() {
 		logger.Warn("No gcp mount was enabled, so skip the operation")
 		return
 	}
-
-	gcsClient, err := storage.NewClient(ctx)
-	if err != nil {
-		logger.Error("Unable to initialize GCS client", err)
-		os.Exit(1)
+	if len(targetPaths) != 0 {
+		ts := make([]string, 0, len(targetPaths))
+		for _, t := range targetPaths {
+			if slices.Contains(mountPaths, t) {
+				ts = append(ts, t)
+			}
+		}
+		mountPaths = ts
 	}
 
 	generateSecrets := func(mountPath string) error {
-		path := fmt.Sprintf("%s%s", mountPath, "static-accounts") // The mountPath includes / at the suffix, so it is supposed to be like "gcp/static-accounts".
-		secret, err := client.Logical().ListWithContext(ctx, path)
+		listStaticAccounts := fmt.Sprintf("%s%s", mountPath, "static-accounts") // The mountPath includes / at the suffix, so it is supposed to be like "gcp/static-accounts".
+		list, err := client.Logical().ListWithContext(ctx, listStaticAccounts)
 		if err != nil {
 			logger.Error("Unable to list gcp static accounts", err)
 			os.Exit(1)
 		}
-		serviceAccounts, ok := extractListData(secret)
+		serviceAccounts, ok := extractListData(list)
 		if len(serviceAccounts) == 0 || !ok {
-			logger.Warn(fmt.Sprintf("No static account exists in the path, %s", path))
+			logger.Warn(fmt.Sprintf("No static account exists in the path, %s", listStaticAccounts))
 			return nil
 		}
+
 		var wg sync.WaitGroup
 		for _, account := range serviceAccounts {
 			wg.Add(1)
 			go func(name string) {
 				defer wg.Done()
-				path = fmt.Sprintf("%s%s/%s/%s", mountPath, "static-account", name, "key")
+
+				generateKey := fmt.Sprintf("%s%s/%s/%s", mountPath, "static-account", name, "key")
 				req := map[string][]string{"ttl": {gcpServiceAccountKeyTTL}}
-				secret, err := client.Logical().ReadWithDataWithContext(ctx, path, req)
+				secret, err := client.Logical().ReadWithDataWithContext(ctx, generateKey, req)
 				if err != nil && strings.Contains(err.Error(), "Precondition check failed.") {
-					logger.Error(fmt.Sprintf("There is a default limit of 10 keys per Service Account, please revise the ttl and the interval of this job, %s", path), err)
+					logger.Error(fmt.Sprintf("There is a default limit of 10 keys per Service Account, please revise the ttl and the interval of this job, %s", generateKey), err)
 					os.Exit(1)
 				}
 				if err != nil {
-					logger.Error(fmt.Sprintf("Unable to read data, %s", path), err)
+					logger.Error(fmt.Sprintf("Unable to read data, %s", generateKey), err)
 					os.Exit(1)
 				}
 				if secret == nil || secret.Data == nil {
-					logger.Error(fmt.Sprintf("No value found at %s", path))
+					logger.Error(fmt.Sprintf("No value found at %s", generateKey))
 					os.Exit(1)
 				}
 
 				pkd, ok := secret.Data["private_key_data"]
 				if !ok {
-					logger.Error(fmt.Sprintf("No private key data found"))
+					logger.Error("No private key data found")
 					os.Exit(1)
 				}
 
-				path = fmt.Sprintf("%s%s/%s", mountPath, name, now.Format(time.RFC3339))
-				if strings.Contains(mountPath, "gcp") {
-					path = strings.Replace(path, "gcp/", "", 1)
+				lookup, err := client.Sys().Lookup(secret.LeaseID)
+				if err != nil {
+					logger.Error(fmt.Sprintf("Unable to lookup the lease, %s", secret.LeaseID), err)
+					os.Exit(1)
 				}
-				w := gcsClient.Bucket(bucket).Object(path).NewWriter(ctx)
+				if lookup == nil || lookup.Data == nil {
+					logger.Error(fmt.Sprintf("No lease found, %s", secret.LeaseID))
+					os.Exit(1)
+				}
+
+				var (
+					issueTime  string
+					expireTime string
+				)
+				if v, ok := lookup.Data["issue_time"]; ok {
+					if t, err := time.Parse(time.RFC3339, v.(string)); err == nil {
+						issueTime = t.Local().Format(time.RFC3339)
+					}
+				}
+				if v, ok := lookup.Data["expire_time"]; ok {
+					if t, err := time.Parse(time.RFC3339, v.(string)); err == nil {
+						expireTime = t.Local().Format(time.RFC3339)
+					}
+				}
+
+				file := fmt.Sprintf("%s%s", mountPath, name)
+				if !force {
+					file = fmt.Sprintf("%s/%s", file, now.Format(time.RFC3339))
+				}
+				if strings.Contains(mountPath, "gcp") {
+					file = strings.Replace(file, "gcp/", "", 1)
+				}
+
+				w := gcsClient.Bucket(bucket).Object(file).NewWriter(ctx)
+				w.ObjectAttrs.Metadata = map[string]string{
+					"issue_time":  issueTime,
+					"expire_time": expireTime,
+				}
 				if _, err := w.Write([]byte(pkd.(string))); err != nil {
 					logger.Error("Unable to create a file in the bucket", err)
 					os.Exit(1)
