@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vault-gcp-sakey-gen
+  namespace: vault
+spec:
+  schedule: "0 9 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vault-gcp-sakey-gen
+          containers:
+          - name: vault-gcp-sakey-gen
+            image: knanao/vault-gcp-sakey-gen@v0.1.0
+            imagePullPolicy: IfNotPresent
+            args:
+            - --kubernetes-auth-role=vault-gcp-sakey-gen
+            - --bucket=vault-gcp-sakey
+            env:
+            - name: VAULT_ADDR
+              value: https://vault:8200
+            - name: TZ
+              value: Asia/Tokyo
+            # When enabling TLS
+            - name: VAULT_CACERT
+              value: /vault/userconfig/vault-tls/ca.crt
+            # When using TLS with Client-side Certificate Authentication
+            - name: VAULT_CLIENT_CERT
+              value: /vault/userconfig/vault-tls/tls.crt
+            - name: VAULT_CLIENT_KEY
+              value: /vault/userconfig/vault-tls/tls.key
+            volumeMounts:
+            - mountPath: /vault/userconfig/vault-tls
+              name: vault-tls
+              readOnly: true
+          volumes:
+          - name: vault-tls
+            secret:
+              defaultMode: 420
+              secretName: vault-tls
+          restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  annotations:
+    # For GKE
+    # https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity
+    iam.gke.io/gcp-service-account: vault-gcp-sakey-gen@{PROJECT_ID}.iam.gserviceaccount.com
+    # For EKS
+    # https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html
+    #eks.amazonaws.com/role-arn: arn:aws:iam::{ACCOUNT_ID}:role/vault-gcp-sakey-gen
+  name: vault-gcp-sakey-gen
+  namespace: vault
