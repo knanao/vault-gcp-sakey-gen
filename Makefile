@@ -1,5 +1,5 @@
 BUILD_VERSION=v0.1.0
-REPOSITORY=knanao/vault-gcp-sakey-gen
+REPOSITORY=ghcr.io/knanao/vault-gcp-sakey-gen
 
 .PHONY: build
 build:
