@@ -29,7 +29,7 @@ func main() {
 	flag.StringVar(&serviceAccountTokenPath, "service-account-token-path", "/var/run/secrets/kubernetes.io/serviceaccount/token", "The path of application's Kubernetes service account token.")
 	flag.StringVar(&gcpServiceAccountKeyTTL, "ttl", "24h", "Time to live (TTL) for service account key.")
 	flag.StringVar(&bucket, "bucket", "", "The bucket name of Google Cloud Storage(GCS).")
-	flag.StringVar(&targets, "targets", "", "The target mount paths of the GCP secret engine must include a trailing /. e.g. -targets=gcp/,gcp/dev/")
+	flag.StringVar(&targets, "targets", "", "The target mount paths of the GCP secret engine must include a trailing /. e.g. --targets=gcp/,gcp/dev/")
 	flag.BoolVar(&force, "force", false, "By default, the key file is named with a timestamp. If this flag is enabled, the name of the static accounts is used instead, and the file is overridden each time.")
 	flag.Parse()
 
@@ -182,7 +182,7 @@ func main() {
 				return nil
 			})
 		}
-		return mg.Wait()
+		return mg.Wait().ErrorOrNil()
 	}
 
 	var (
@@ -195,15 +195,14 @@ func main() {
 		path := p
 		mg.Go(func() error {
 			if err := retry(generateSecrets, path, retryCount, sleepTime); err != nil {
-				logger.Error(fmt.Sprintf("Unable to generate secrets in the path, %s", path), err)
-				return err
+				return fmt.Errorf("Unable to generate secrets in the path, %s: %v", path, err)
 			}
 			logger.Debug("Succeeded to generate GCP static account key in the path, %s", path)
 			return nil
 		})
 	}
 
-	if err := mg.Wait(); err != nil {
+	if err := mg.Wait().ErrorOrNil(); err != nil {
 		logger.Error(err.Error())
 		os.Exit(1)
 	}
