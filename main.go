@@ -75,6 +75,19 @@ func main() {
 		}
 	}
 
+	// Create operation token internally for running all operations in order to prevent expiring the service account key when this cron job is down.
+	req := &vault.TokenCreateRequest{TTL: gcpServiceAccountKeyTTL}
+	resp, err := client.Auth().Token().CreateOrphanWithContext(ctx, req)
+	if err != nil {
+		logger.Error("Unable to create operation token", err)
+		os.Exit(1)
+	}
+	if resp.Auth == nil {
+		logger.Error("Unable to retrieve the created operation token")
+		os.Exit(1)
+	}
+	client.SetToken(resp.Auth.ClientToken)
+
 	gcsClient, err := storage.NewClient(ctx)
 	if err != nil {
 		logger.Error("Unable to initialize GCS client", err)
